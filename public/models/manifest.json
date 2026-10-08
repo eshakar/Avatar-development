@@ -1,1 +1,24 @@
-[]
+[
+  {
+    "name": "Cesar",
+    "file": "cesar/cesar.fbx",
+    "family": "cc3",
+    "tag": "ActorCore · photo-scanned · 5 outfits",
+    "emoji": "🧥",
+    "accent": "#a3e635",
+    "pbr": {
+      "normal": "normal.jpg",
+      "roughness": "roughness.jpg",
+      "metallic": "metallic.jpg",
+      "ao": "ao.jpg",
+      "defaultVariant": "01",
+      "variants": [
+        { "id": "00", "name": "Black", "color": "#1d1d22", "map": "diffuse-00.jpg" },
+        { "id": "01", "name": "Olive", "color": "#4d5a2c", "map": "diffuse-01.jpg" },
+        { "id": "02", "name": "Cream", "color": "#d8cdb8", "map": "diffuse-02.jpg" },
+        { "id": "03", "name": "Red", "color": "#7d1b25", "map": "diffuse-03.jpg" },
+        { "id": "04", "name": "Navy", "color": "#1f2a4d", "map": "diffuse-04.jpg" }
+      ]
+    }
+  }
+]

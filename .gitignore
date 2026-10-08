@@ -1,2 +1,5 @@
 node_modules
 dist
+
+# Licensed third-party assets (ActorCore etc.): keep them out of the repo
+public/models/*/

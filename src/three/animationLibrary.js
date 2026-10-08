@@ -2,6 +2,10 @@ import * as THREE from 'three';
 
 // Every Mixamo rig shares the same "mixamorig" bone names, so clips from one
 // character can drive any other. This pools clips and adapts them per target.
+// Clips can carry a licence restriction: Ready Player Me animations may only drive RPM avatars.
+const DANCE = /danc|samba|hip.?hop|salsa|twerk|shuffle|break|groove|robot|swing|tut|thriller|gangnam|macarena|rumba|tango|jazz|b-?boy|cheer|party|bounce|step|wave|house|krump|vogue/i;
+
+export const licensedFor = (sourceDef, targetDef) => !sourceDef.rpmOnly || targetDef.family === 'rpm';
 export class AnimationLibrary {
   constructor() {
     this.entries = new Map();
@@ -19,20 +23,22 @@ export class AnimationLibrary {
         name = `${clip.name} · ${asset.def.name}`;
         if (this.entries.has(name)) continue;
       }
-      this.entries.set(name, { name, clip, asset });
+      const dance = asset.def.dance ?? (DANCE.test(clip.name) || asset.def.upload === true);
+      this.entries.set(name, { name, clip, asset, dance });
       added.push(name);
     }
     return added;
   }
 
-  names() {
-    return [...this.entries.keys()];
+  entry(name) {
+    return this.entries.get(name);
   }
 
   list(target) {
     return [...this.entries.values()].map((e) => ({
       name: e.name,
       source: e.asset.def.name,
+      dance: e.dance,
       duration: e.clip.duration,
       native: e.asset === target,
       compatible: target ? (this.clipFor(e.name, target)?.tracks.length ?? 0) > 0 : false,
@@ -43,6 +49,7 @@ export class AnimationLibrary {
     const entry = this.entries.get(name);
     if (!entry) return null;
     if (entry.asset === target) return entry.clip;
+    if (!licensedFor(entry.asset.def, target.def)) return null;
 
     const key = `${name}|${target.def.url}`;
     if (this.adapted.has(key)) return this.adapted.get(key);
@@ -50,6 +57,16 @@ export class AnimationLibrary {
     const src = entry.asset.rig;
     const tgt = target.rig;
     const tracks = [];
+    // Same skeleton family (e.g. RPM animation → RPM avatar): the clip already fits, use it as is.
+    if (entry.asset.def.family && entry.asset.def.family === target.def.family) {
+      for (const track of entry.clip.tracks) {
+        const { nodeName, propertyName } = THREE.PropertyBinding.parseTrackName(track.name);
+        if (target.nodeNames.has(nodeName) && propertyName !== 'scale') tracks.push(track);
+      }
+      const clip = new THREE.AnimationClip(name, entry.clip.duration, tracks);
+      this.adapted.set(key, clip);
+      return clip;
+    }
     for (const track of entry.clip.tracks) {
       const { nodeName, propertyName } = THREE.PropertyBinding.parseTrackName(track.name);
       if (!target.nodeNames.has(nodeName) || propertyName === 'scale') continue;
