@@ -1,8 +1,13 @@
 # Avatar Lab · Dance Studio
 
 A browser studio that makes a 3D avatar dance **in sync with any song** and renders it to an MP4 with the mixed
-audio. Built with **Three.js** (rendering), **Web Audio** (mixing + beat detection), **WebCodecs/Mediabunny** (export),
-**React + Zustand + Framer Motion** (UI).
+audio. Built with **Three.js** (rendering), **GSAP** (scene transitions), **Web Audio** (mixing + beat detection),
+**WebCodecs/Mediabunny** (export), **React + Zustand + Framer Motion** (UI).
+
+GSAP animates the interactive transitions: avatars spin in and out, backgrounds fade through black, the camera
+glides between shots or modes you pick, grade presets crossfade, and look/outfit changes get a squash-and-settle.
+The dance, auto-cut camera and beat effects stay pure functions of the song time, so the exported video matches
+the preview frame for frame. Any running transition is finished before an export starts.
 
 ```bash
 npm install

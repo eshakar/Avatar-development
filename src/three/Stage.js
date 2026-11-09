@@ -6,6 +6,7 @@ import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js'
 import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
 import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import gsap from 'gsap';
 import { clone as cloneSkinned } from 'three/addons/utils/SkeletonUtils.js';
 import { loadAsset } from './loadAvatar.js';
 import { applyLook, disposeLook, listParts } from './materials.js';
@@ -46,6 +47,8 @@ export const DEFAULT_FX = {
 // How much each shot punches into real footage (video backgrounds can't change camera angle).
 const PLATE_ZOOM = { full: 1, wide: 1, medium: 1.4, close: 1.9, left: 1.15, right: 1.15, low: 1.1, high: 1.2 };
 
+const _lookAt = new THREE.Vector3();
+
 const GradeShader = {
   uniforms: {
     tDiffuse: { value: null },
@@ -58,13 +61,14 @@ const GradeShader = {
     warmth: { value: 0 },
     split: { value: 0 },
     flash: { value: 0 },
+    fade: { value: 1 },
     aspect: { value: 1 },
     crop: { value: new THREE.Vector3(0.5, 0.5, 1) },
   },
   vertexShader: 'varying vec2 vUv; void main(){ vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }',
   fragmentShader: `
     uniform sampler2D tDiffuse;
-    uniform float time, grain, vignette, chroma, contrast, saturation, warmth, split, flash, aspect;
+    uniform float time, grain, vignette, chroma, contrast, saturation, warmth, split, flash, fade, aspect;
     uniform vec3 crop;
     varying vec2 vUv;
     float hash(vec2 p) { return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453); }
@@ -84,7 +88,7 @@ const GradeShader = {
       vec2 vc = c * vec2(aspect, 1.0) / max(aspect, 1.0);
       col *= mix(1.0, smoothstep(0.95, 0.25, length(vc) * 1.35), vignette);
       col += (hash(vUv * 1931.0 + fract(time * 7.13)) - 0.5) * grain * 0.09;
-      gl_FragColor = vec4(clamp(col, 0.0, 1.0), 1.0);
+      gl_FragColor = vec4(clamp(col, 0.0, 1.0) * (1.0 - fade), 1.0);
     }`,
 };
 
@@ -106,6 +110,10 @@ export class Stage {
     this.customEnvs = new Map();
     this.smile = 0.25;
     this.camState = { pos: new THREE.Vector3(), target: new THREE.Vector3(), fov: 40, roll: 0 };
+    // GSAP owns the interactive transitions (avatar swaps, background fades, camera moves, grade
+    // changes). The dance, auto-cut camera and beat effects stay pure functions of t for export.
+    this.tweens = new Set();
+    this.camBlend = { w: 0, pos: new THREE.Vector3(), target: new THREE.Vector3(), fov: 40 };
 
     this.#initRenderer();
     this.#initScene();
@@ -190,6 +198,26 @@ export class Stage {
     this.composer.addPass(this.grade);
   }
 
+  // ------------------------------------------------------------------ tweens
+
+  #tween(target, vars, method = 'to', from) {
+    const tween = method === 'fromTo' ? gsap.fromTo(target, from, vars) : gsap.to(target, vars);
+    this.tweens.add(tween);
+    const done = () => this.tweens.delete(tween);
+    tween.eventCallback('onInterrupt', done);
+    const onComplete = vars.onComplete;
+    tween.eventCallback('onComplete', () => {
+      done();
+      onComplete?.();
+    });
+    return tween;
+  }
+
+  // Jump every running transition to its end state (export renders must not catch one mid-flight).
+  #settle() {
+    for (const tween of [...this.tweens]) tween.progress(1);
+  }
+
   // ------------------------------------------------------------------ layout
 
   setAspect(aspect) {
@@ -244,13 +272,18 @@ export class Stage {
     const def = ENVIRONMENTS.find((e) => e.id === id) ?? this.customEnvs.get(id) ?? ENVIRONMENTS[0];
     const token = (this.envToken = (this.envToken ?? 0) + 1);
     this.cb.onLoading?.({ active: true, label: def.name });
+    const fade = this.grade.uniforms.fade;
+    // Fade to black while the new background loads (the very first load starts black already).
+    const fadeOut = this.env ? this.#tween(fade, { value: 1, duration: 0.35, ease: 'power2.in', overwrite: true }) : null;
+    const fadeIn = () => this.#tween(fade, { value: 0, duration: 0.7, ease: 'power2.out', overwrite: true });
     let env;
     try {
-      env = await buildEnvironment(def, { studioColor: this.fx.studioColor, video: this.video });
+      [env] = await Promise.all([buildEnvironment(def, { studioColor: this.fx.studioColor, video: this.video }), fadeOut]);
     } catch (err) {
       console.error(err);
       this.cb.onError?.(`Couldn't load the ${def.name} background`);
       this.cb.onLoading?.({ active: false });
+      if (token === this.envToken) fadeIn();
       return;
     }
     if (token !== this.envToken) return env.dispose();
@@ -269,6 +302,7 @@ export class Stage {
     this.shadowCatcher.visible = def.kind === 'hdri' || def.kind === 'video';
     this.#fitVideo();
     this.#applyFx();
+    fadeIn();
     this.cb.onLoading?.({ active: false });
   }
 
@@ -287,10 +321,7 @@ export class Stage {
       return null;
     }
     if (token !== this.avatarToken) return null;
-    if (this.hero) {
-      this.scene.remove(this.hero.holder);
-      disposeLook(this.hero.model);
-    }
+    if (this.hero) this.#retire(this.hero);
 
     const model = cloneSkinned(asset.root);
     const fit = new THREE.Group();
@@ -298,8 +329,11 @@ export class Stage {
     fit.position.copy(asset.offset);
     fit.rotation.y = def.rotationY ?? 0;
     fit.add(model);
+    // holder: entrance spin/scale. pulse: squash on look changes. fit: static normalisation.
+    const pulse = new THREE.Group();
+    pulse.add(fit);
     const holder = new THREE.Group();
-    holder.add(fit);
+    holder.add(pulse);
     this.scene.add(holder);
 
     const rig = new CharacterRig(model, { rotationY: def.rotationY ?? 0 });
@@ -310,13 +344,52 @@ export class Stage {
     model.traverse((o) => {
       if (o.isMesh && o.morphTargetDictionary?.mouthSmile !== undefined) morphs.push(o);
     });
-    this.hero = { def, asset, model, holder, rig, choreo, morphs };
+    const entering = Boolean(this.hero);
+    this.hero = { def, asset, model, holder, pulse, rig, choreo, morphs };
+
+    // The rig measured itself at rest above, so the entrance only animates the outer group.
+    const delay = entering ? 0.2 : 0;
+    holder.scale.setScalar(0.001);
+    holder.rotation.y = -Math.PI * 1.5;
+    this.#tween(holder.scale, { x: 1, y: 1, z: 1, duration: 1.2, delay, ease: 'elastic.out(1, 0.6)' });
+    this.#tween(holder.rotation, { y: 0, duration: 1.3, delay, ease: 'power3.out' });
     this.cb.onLoading?.({ active: false });
     return { asset, rig, parts: listParts(model) };
   }
 
+  #retire(hero) {
+    const { holder } = hero;
+    gsap.killTweensOf([holder.scale, holder.rotation]);
+    this.#tween(holder.rotation, { y: holder.rotation.y + Math.PI, duration: 0.35, ease: 'power2.in' });
+    this.#tween(holder.scale, {
+      x: 0.001,
+      y: 0.001,
+      z: 0.001,
+      duration: 0.35,
+      ease: 'back.in(2)',
+      onComplete: () => {
+        this.scene.remove(holder);
+        disposeLook(hero.model);
+      },
+    });
+  }
+
   setLook(look) {
-    if (this.hero) applyLook(this.hero.model, look.style, look.tint, look.parts);
+    if (!this.hero) return;
+    applyLook(this.hero.model, look.style, look.tint, look.parts);
+    this.#squash();
+  }
+
+  // A quick squash-and-settle so look/outfit changes read as an event (skipped during the entrance).
+  #squash() {
+    const { holder, pulse } = this.hero;
+    if (this.exporting || gsap.isTweening(holder.scale)) return;
+    this.#tween(
+      pulse.scale,
+      { x: 1, y: 1, z: 1, duration: 0.8, ease: 'elastic.out(1, 0.35)', overwrite: true },
+      'fromTo',
+      { x: 1.06, y: 0.93, z: 1.06 },
+    );
   }
 
   // Swap the colour map of a PBR avatar's outfit variant, then re-apply the current look on top.
@@ -346,6 +419,18 @@ export class Stage {
   }
 
   setCamera(patch) {
+    const prev = { ...this.cameraOpts };
+    const moved = (patch.mode !== undefined && patch.mode !== prev.mode) || (patch.shot !== undefined && patch.shot !== prev.shot);
+    if (moved && this.camInitialized && !this.exporting) {
+      // Glide from wherever the camera is now instead of jump-cutting to the new framing.
+      const b = this.camBlend;
+      b.pos.copy(this.camera.position);
+      b.target.copy(prev.mode === 'free' ? this.controls.target : this.camState.target);
+      b.fov = this.camera.fov;
+      b.w = 1;
+      this.#tween(b, { w: 0, duration: 1, ease: 'power3.inOut', overwrite: true });
+    }
+    this.camInitialized = true;
     Object.assign(this.cameraOpts, patch);
     this.shotPlan = planShots(this.grid, this.cameraOpts);
     const free = this.cameraOpts.mode === 'free';
@@ -365,10 +450,13 @@ export class Stage {
     u.grain.value = fx.grain;
     u.vignette.value = fx.vignette;
     u.chroma.value = fx.chroma;
-    u.contrast.value = g.contrast;
-    u.saturation.value = g.saturation;
-    u.warmth.value = g.warmth;
-    u.split.value = g.split;
+    // Switching grade presets crossfades; the first apply (and export) sets them directly.
+    const gradeChanged = this.appliedGrade !== undefined && this.appliedGrade !== fx.grade && !this.exporting;
+    this.appliedGrade = fx.grade;
+    for (const key of ['contrast', 'saturation', 'warmth', 'split']) {
+      if (gradeChanged) this.#tween(u[key], { value: g[key], duration: 0.6, ease: 'power2.out', overwrite: true });
+      else if (!gsap.isTweening(u[key])) u[key].value = g[key];
+    }
     this.gtao.enabled = fx.ao;
     const env = this.env;
     this.renderer.toneMappingExposure = fx.exposure * (env?.def.exposure ?? 1);
@@ -416,10 +504,12 @@ export class Stage {
     } else {
       this.grade.uniforms.crop.value.set(0.5, 0.5, 1);
       const cam = cameraAt(t, grid, this.cameraOpts, this.aspect, this.shotPlan, this.camState, this.#followPoint());
-      this.camera.position.copy(cam.pos);
+      const b = this.camBlend;
+      const w = this.exporting ? 0 : b.w;
+      this.camera.position.copy(cam.pos).lerp(b.pos, w);
       this.camera.up.set(Math.sin(cam.roll), Math.cos(cam.roll), 0);
-      this.camera.lookAt(cam.target);
-      this.camera.fov = cam.fov;
+      this.camera.lookAt(_lookAt.copy(cam.target).lerp(b.target, w));
+      this.camera.fov = THREE.MathUtils.lerp(cam.fov, b.fov, w);
       this.camera.updateProjectionMatrix();
     }
 
@@ -486,6 +576,7 @@ export class Stage {
   // ------------------------------------------------------------------ export
 
   beginExport(width, height, times = []) {
+    this.#settle();
     this.exporting = true;
     this.savedRatio = this.renderer.getPixelRatio();
     this.#setSize(width, height, 1);
@@ -516,6 +607,7 @@ export class Stage {
   }
 
   dispose() {
+    for (const tween of this.tweens) tween.kill();
     this.renderer.setAnimationLoop(null);
     this.resizeObserver.disconnect();
     this.controls.dispose();
